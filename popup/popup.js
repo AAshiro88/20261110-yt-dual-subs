@@ -219,4 +219,15 @@ targetEl.addEventListener('change', () => {
   postSetting({ targetLang: targetEl.value });
 });
 
+/** 重新套用：通知 content script 清掉失敗狀態並整輪重抓 */
+document.getElementById('refresh').addEventListener('click', async () => {
+  if (activeTabId == null) return;
+  try {
+    await chrome.tabs.sendMessage(activeTabId, { type: 'YDS_REFRESH' });
+    setStatus('已重新套用，字幕重新抓取中…');
+  } catch (e) {
+    setStatus('無法連線到頁面，請重新載入 YouTube 分頁');
+  }
+});
+
 init();

@@ -80,6 +80,11 @@
         potc: u.searchParams.get('potc') || '1',
         c: u.searchParams.get('c') || 'WEB'
       };
+      // 除錯資訊：可在頁面主控台確認 pot 的擷取來源與時間
+      console.debug(
+        '[yds] pot captured',
+        { videoId: potInfo.videoId, lang: u.searchParams.get('lang'), kind: u.searchParams.get('kind') }
+      );
       // 同時記下這條字幕軌的完整網址，供翻譯請求使用
       playerUrls.set(
         potInfo.videoId + '|' + (u.searchParams.get('lang') || '') + '|' + (u.searchParams.get('kind') || ''),
@@ -123,6 +128,53 @@
   }
 
   /**
+   * 從 DOM 的 <track src> 擷取字幕請求網址。
+   * CC 開啟時 YouTube 會在 <video> 內放入 <track> 元素，其 src 就是完整
+   * 的 timedtext 網址（含 pot 等所有簽章參數）。播放器的字幕請求不一定
+   * 經過可攔截的 fetch/XHR（部分走 Web Worker 等內部管線），因此抓不到
+   * pot 時改從這裡取得，是最不依賴播放器內部實作的來源。
+   */
+  function scanCaptionTrackElements() {
+    try {
+      const trackEls = document.querySelectorAll('track[src]');
+      for (const el of trackEls) {
+        capturePot(el.getAttribute('src'));
+      }
+    } catch (e) {
+      // DOM 查詢失敗就忽略，下一輪再試
+    }
+  }
+
+  /**
+   * 監聽整個文件的新增節點，看到 <track> 就立刻擷取其 src。
+   * 這樣 CC 剛開啟的瞬間就能抓到，不用等輪詢。
+   */
+  const trackObserver = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node.tagName === 'TRACK') {
+          capturePot(node.getAttribute('src'));
+        } else if (node.querySelectorAll) {
+          const trackEls = node.querySelectorAll('track[src]');
+          for (const el of trackEls) capturePot(el.getAttribute('src'));
+        }
+      }
+    }
+  });
+
+  function startTrackObserver() {
+    if (document.documentElement) {
+      trackObserver.observe(document.documentElement, { childList: true, subtree: true });
+      scanCaptionTrackElements(); // 觀察前就存在的 <track> 也要掃一次
+    } else {
+      window.setTimeout(startTrackObserver, 200);
+    }
+  }
+
+  startTrackObserver();
+
+  /**
    * 從 YouTube 播放器介面取得字幕是否為開啟狀態
    */
   function isCaptionButtonOn() {
@@ -132,38 +184,49 @@
 
   /**
    * 催促播放器發出一次帶 pot 的 timedtext 請求。
-   * 第一次先開啟字幕，之後改用重新載入字幕，因為剛開啟時播放器的簽章模組
-   * 可能還沒準備好，第一個請求會沒有 pot。
-   * CC 已經開啟時，單純 toggleSubtitlesOn 不會讓播放器發出新請求，
-   * reload 也可能無效，因此先關閉再開啟，迫使播放器重新請求字幕軌。
+   * 主要手段：直接點擊 CC 按鈕。這與使用者手動開啟字幕是同一條路徑，
+   * 播放量器一定會重新請求字幕軌（這次請求會帶 pot）。
+   * 備援：player.loadModule('captions') 與 setOption reload。
+   * 注意：不要依賴 player.toggleSubtitlesOn 之類的方法，它們不保證存在，
+   * typeof 檢查失敗時 poke 會默默無效，pot 永遠拿不到。
    * @param attempt 第幾次嘗試，從 0 開始
    */
   function pokePlayer(attempt) {
     const player = document.getElementById('movie_player');
     if (!player) return;
     try {
+      const ccBtn = document.querySelector('.ytp-subtitles-button');
+      const ccDisabled = ccBtn && ccBtn.getAttribute('aria-disabled') === 'true';
+      const ccOn = isCaptionButtonOn();
+      console.debug('[yds] poke', { attempt, ccBtn: !!ccBtn, ccOn, ccDisabled });
+
       if (attempt === 0) {
-        if (isCaptionButtonOn()) {
-          // CC 已開啟：關閉 → 稍後再開啟，觸發重新請求（使用者原本的開啟狀態會被還原）
-          if (typeof player.toggleSubtitles === 'function') {
-            player.toggleSubtitles(); // 關閉
+        if (ccBtn && !ccDisabled && typeof ccBtn.click === 'function') {
+          // 模擬使用者點 CC：關閉的開啟它；已開啟的關閉再開啟（強迫重新請求）
+          ccBtn.click();
+          if (ccOn) {
             window.setTimeout(() => {
               try {
-                if (typeof player.toggleSubtitles === 'function') {
-                  player.toggleSubtitles(); // 重新開啟，這次請求會帶 pot
+                const btn = document.querySelector('.ytp-subtitles-button');
+                if (btn && btn.getAttribute('aria-pressed') !== 'true' && typeof btn.click === 'function') {
+                  btn.click();
                 }
               } catch (e) {
                 // 重新開啟失敗於下一輪再試
               }
             }, 700);
-          } else if (typeof player.toggleSubtitlesOn === 'function') {
-            player.toggleSubtitlesOn();
           }
-        } else if (typeof player.toggleSubtitlesOn === 'function') {
-          player.toggleSubtitlesOn();
+        } else if (typeof player.toggleSubtitles === 'function') {
+          player.toggleSubtitles();
         }
-      } else if (typeof player.setOption === 'function') {
-        player.setOption('captions', 'reload', true);
+      } else {
+        // 後續嘗試：載入字幕模組並要求重新載入字幕設定
+        if (typeof player.loadModule === 'function') {
+          player.loadModule('captions');
+        }
+        if (typeof player.setOption === 'function') {
+          player.setOption('captions', 'reload', true);
+        }
       }
     } catch (e) {
       // 播放器方法不存在或呼叫失敗，等下一輪再試
@@ -171,7 +234,8 @@
   }
 
   /** 若原本字幕是關閉的，取得 pot 後把播放器字幕還原為關閉 */
-  function restoreCaptionState() {    const player = document.getElementById('movie_player');
+  function restoreCaptionState() {
+    const player = document.getElementById('movie_player');
     if (!player) return;
     try {
       if (isCaptionButtonOn() && typeof player.toggleSubtitles === 'function') {
@@ -208,6 +272,8 @@
       };
 
       const timer = window.setInterval(() => {
+        // 輪詢時同步掃描 DOM 的 <track src>，CC 開著時這裡通常一次就抓到 pot
+        scanCaptionTrackElements();
         const elapsed = Date.now() - startedAt;
         if (potMatches(videoId)) {
           finish(potInfo);
@@ -220,7 +286,8 @@
         if (elapsed >= nextPokeAt) {
           pokePlayer(attempt);
           attempt += 1;
-          nextPokeAt = elapsed + 2000;
+          // 播放器每次發請求也算 timedtext 流量，poke 太密集會造成 HTTP 429
+          nextPokeAt = elapsed + 2500;
         }
       }, 300);
     });
@@ -370,9 +437,322 @@
     }
 
     if (ev.data.event === 'yds:fetch') {
-      handleSubtitleFetch(ev.data.key, ev.data.baseUrl, ev.data.tlang);
+      handleSubtitleFetch(ev.data.key, ev.data.baseUrl, ev.data.tlang, ev.data.lang, ev.data.kind);
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // timedtext 請求序列化：自身請求全部經過同一個隊列並保持最小間距。
+  // 短時間內多筆請求（第一行、第二行、pot 重試）會被 YouTube 判定頻繁而 HTTP 429。
+  // ---------------------------------------------------------------------------
+  const TT_MIN_GAP_MS = 900;
+  const timedTextQueue = [];
+  let lastTimedTextAt = 0;
+  let queueRunning = false;
+
+  function runTimedTextQueue() {
+    if (queueRunning) return;
+    queueRunning = true;
+    const step = () => {
+      const item = timedTextQueue.shift();
+      if (!item) {
+        queueRunning = false;
+        return;
+      }
+      const wait = TT_MIN_GAP_MS - (Date.now() - lastTimedTextAt);
+      window.setTimeout(() => {
+        lastTimedTextAt = Date.now();
+        item.task().then(item.resolve, item.reject).then(step, step);
+      }, wait > 0 ? wait : 0);
+    };
+    step();
+  }
+
+  /** 把一個會回傳 timedtext 內容的任務排進序列，保證請求之間有最小間距 */
+  function enqueueTimedText(task) {
+    return new Promise((resolve, reject) => {
+      timedTextQueue.push({ task, resolve, reject });
+      runTimedTextQueue();
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // InnerTube 字幕稿端點（get_transcript）
+  //
+  // 與 timedtext 不同：此端點不帶 pot、也有完整的翻譯支援（回應的語言選單
+  // 內含各翻譯語言自己的 continuation params），且不走 timedtext 的 tlang
+  // 節流桶。翻譯字幕優先走這條路，失敗才退回 timedtext 流程。
+  // proto 結構參考 Invidious 的 Transcript.generate_param 實作。
+  // ---------------------------------------------------------------------------
+
+  const GET_TRANSCRIPT_URL = 'https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false';
+
+  /** 從頁面取得 InnerTube 的公開金鑰與 context（本來就內嵌在頁面中） */
+  function getInnertubeConfig() {
+    try {
+      if (!window.ytcfg || typeof window.ytcfg.get !== 'function') return null;
+      const apiKey = window.ytcfg.get('INNERTUBE_API_KEY');
+      const context = window.ytcfg.get('INNERTUBE_CONTEXT');
+      if (!apiKey || !context) return null;
+      return { apiKey, context, client: context.client || {} };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 計算 SHA-1 hex（供登入使用者的 SAPISIDHASH 授權用） */
+  async function sha1Hex(text) {
+    const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text));
+    const bytes = new Uint8Array(digest);
+    let hex = '';
+    for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0');
+    return hex;
+  }
+
+  /**
+   * 組登入使用者的授權標頭；未登入回傳 null。
+   * 此值等同頁面自己呼叫 InnerTube 時的 Authorization，僅送進請求，
+   * 不寫入任何記錄或訊息，避免知名的雜湊值外流。
+   */
+  async function buildAuthHeader() {
+    try {
+      const match = document.cookie.match(/SAPISID=([A-Za-z0-9_-]+)/);
+      if (!match) return null;
+      const sapisid = match[1];
+      const timestamp = Math.floor(Date.now() / 1000);
+      const hashHex = await sha1Hex(timestamp + ' ' + sapisid + ' ' + window.location.origin);
+      return 'SAPISIDHASH ' + timestamp + '_' + hashHex;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** protobuf varint 編碼 */
+  function pbVarint(value) {
+    const out = [];
+    let v = value;
+    while (v > 0x7f) {
+      out.push((v & 0x7f) | 0x80);
+      v >>>= 7;
+    }
+    out.push(v);
+    return out;
+  }
+
+  /** 合併多段 Uint8Array */
+  function pbConcat(parts) {
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) {
+      out.set(p, offset);
+      offset += p.length;
+    }
+    return out;
+  }
+
+  /** 字串欄位（wire type 2） */
+  function pbStringField(field, str) {
+    const bytes = new TextEncoder().encode(str);
+    return pbConcat([pbVarint((field << 3) | 2), pbVarint(bytes.length), bytes]);
+  }
+
+  /** 位元組串欄位（wire type 2，內嵌訊息用） */
+  function pbBytesField(field, bytes) {
+    return pbConcat([pbVarint((field << 3) | 2), pbVarint(bytes.length), bytes]);
+  }
+
+  /** varint 欄位（wire type 0） */
+  function pbVarintField(field, value) {
+    return new Uint8Array(pbVarint((field << 3) | 0).concat(pbVarint(value)));
+  }
+
+  /** bytes → base64 */
+  function bytesToBase64(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 4096) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 4096));
+    }
+    return btoa(bin);
+  }
+
+  /**
+   * 產生 get_transcript 的 params。
+   * 結構為 Invidious 實測過的編碼：
+   * { 1: videoId, 2: {1: kind, 2: languageCode, 3: ""}, 3: 1,
+   *   5: 面板名稱, 6: 1, 7: 1, 8: 1 }
+   */
+  function buildTranscriptParams(videoId, languageCode, kind) {
+    const inner = pbConcat([
+      pbStringField(1, kind || ''),
+      pbStringField(2, languageCode || ''),
+      pbStringField(3, '')
+    ]);
+    const outer = pbConcat([
+      pbStringField(1, videoId),
+      pbBytesField(2, inner),
+      pbVarintField(3, 1),
+      pbStringField(5, 'engagement-panel-searchable-transcript-search-panel'),
+      pbVarintField(6, 1),
+      pbVarintField(7, 1),
+      pbVarintField(8, 1)
+    ]);
+    return encodeURIComponent(bytesToBase64(outer));
+  }
+
+  /** 解開 params base64（容忍百分比編碼），供語言比對用 */
+  function decodeParamBytes(paramsStr) {
+    try {
+      let s = String(paramsStr || '');
+      try {
+        s = decodeURIComponent(s);
+      } catch (e) {
+        // 原本就是純 base64
+      }
+      s = s.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+      const bin = atob(s);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 在位元組陣列中搜尋另一組位元組（用來確認 params 內含目標語言代碼） */
+  function bytesContain(bytes, needle) {
+    if (!bytes || !needle || !needle.length || bytes.length < needle.length) return false;
+    outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
+      for (let j = 0; j < needle.length; j++) {
+        if (bytes[i + j] !== needle[j]) continue outer;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /** 取得字幕稿面板核心節點（失敗回傳 null） */
+  function extractTranscriptPanel(json) {
+    try {
+      return json.actions[0].updateEngagementPanelAction.content.transcriptRenderer.content
+        .transcriptSearchPanelRenderer;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 從面板抽出字幕段落（跳過章節標題行） */
+  function parseTranscriptSegments(panel) {
+    const segList = panel && panel.body && panel.body.transcriptSegmentListRenderer;
+    const initial = (segList && segList.initialSegments) || [];
+    const events = [];
+    for (const item of initial) {
+      const seg = item && item.transcriptSegmentRenderer;
+      if (!seg) continue; // transcriptSectionHeaderRenderer 等標題行不當字幕
+      const start = parseInt(seg.startMs, 10);
+      const end = parseInt(seg.endMs, 10);
+      const runs = (seg.snippet && seg.snippet.runs) || [];
+      const text = runs.map((r) => (r && r.text) || '').join('').replace(/\s+/g, ' ').trim();
+      if (Number.isNaN(start) || !text) continue;
+      events.push({
+        tStartMs: start,
+        dDurationMs: !Number.isNaN(end) && end > start ? end - start : 5000,
+        text
+      });
+    }
+    events.sort((a, b) => a.tStartMs - b.tStartMs);
+    return events;
+  }
+
+  /** 廣泛尋找節點內的 getTranscriptEndpoint.params（不綁定特定 JSON 形狀） */
+  function pickNestedParams(value) {
+    const stack = [value];
+    while (stack.length) {
+      const v = stack.pop();
+      if (!v || typeof v !== 'object') continue;
+      if (Array.isArray(v)) {
+        for (const x of v) stack.push(x);
+        continue;
+      }
+      for (const key of Object.keys(v)) {
+        const val = v[key];
+        if (key === 'getTranscriptEndpoint' && val && typeof val.params === 'string') return val.params;
+        if (val && typeof val === 'object') stack.push(val);
+      }
+    }
+    return null;
+  }
+
+  /** 從面板抽出語言選單各項（含各翻譯語言自己的 params） */
+  function extractLanguageMenuItems(panel) {
+    try {
+      const items =
+        panel.footer.transcriptFooterRenderer.languageMenu.sortFilterSubMenuRenderer.subMenuItems || [];
+      return items
+        .filter((item) => item)
+        .map((item) => ({ title: item.title || '', params: pickNestedParams(item) }));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /**
+   * 在語言選單中找出「翻譯到 tlang」的選項。
+   * 主判斷：params 解碼後的位元組含 tlang 代碼；備援：以 Intl.DisplayNames
+   * 產生的語言名稱比對選項標題。
+   */
+  function findTranslatedMenuItem(items, tlang, uiLang) {
+    const needle = new TextEncoder().encode(tlang);
+    const titleCandidates = [];
+    for (const langTag of [uiLang || 'en', 'zh-Hant', 'en']) {
+      try {
+        const dn = new Intl.DisplayNames([langTag], { type: 'language' });
+        const name = (dn.of(tlang) || '').toLowerCase();
+        if (name) titleCandidates.push(name);
+      } catch (e) {
+        // Intl 不可用時忽略
+      }
+    }
+    for (const item of items) {
+      if (!item || !item.params) continue;
+      const bytes = decodeParamBytes(item.params);
+      if (bytes && bytesContain(bytes, needle)) return item;
+      const title = String(item.title || '').toLowerCase().trim();
+      if (title && titleCandidates.indexOf(title) !== -1) return item;
+    }
+    return null;
+  }
+
+  /** 等待指定的毫秒 */
+  function delay(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  /**
+   * 向 InnerTube get_transcript 查詢字幕面板。
+   * @param params 直接可用的請求 params
+   */
+  async function fetchTranscriptPanel(params) {
+    const cfg = getInnertubeConfig();
+    if (!cfg) throw new Error('no-innertube-config');
+    const headers = { 'Content-Type': 'application/json' };
+    // 登入使用者需要 SAPISIDHASH 授權；未登入不需要
+    const auth = await buildAuthHeader();
+    if (auth) headers.Authorization = auth;
+    if (cfg.client.visitorData) headers['X-Goog-Visitor-Id'] = cfg.client.visitorData;
+    const response = await originalFetch.call(window, GET_TRANSCRIPT_URL + '&key=' + encodeURIComponent(cfg.apiKey), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers,
+      body: JSON.stringify({ context: cfg.context, params })
+    });
+    if (!response.ok) throw new Error('transcript HTTP ' + response.status);
+    const json = await response.json();
+    const panel = extractTranscriptPanel(json);
+    if (!panel) throw new Error('transcript-no-panel');
+    return panel;
+  }
 
   /** 向 timedtext 發出同源請求並回傳文字內容 */
   async function fetchTimedText(url) {
@@ -394,22 +774,25 @@
    * @param baseUrl - subtitle 軌的 baseUrl
    * @param tlang - 目標翻譯語言（空字串表示直接使用原生字幕軌）
    */
-  async function handleSubtitleFetch(key, baseUrl, tlang) {
+  async function handleSubtitleFetch(key, baseUrl, tlang, lang, kind) {
     try {
       const videoId = videoIdOfUrl(baseUrl) || (cachedTracks && cachedTracks.videoId) || '';
       /** 組出請求網址；pot 為 null 時不帶簽章參數，與舊版行為相同 */
       const trackUrl = new URL(baseUrl, window.location.origin);
-      const playerUrlKey =
-        videoId + '|' + (trackUrl.searchParams.get('lang') || '') + '|' + (trackUrl.searchParams.get('kind') || '');
+      const trackLang = lang || trackUrl.searchParams.get('lang') || '';
+      const trackKind = kind || trackUrl.searchParams.get('kind') || '';
+      const playerUrlKey = videoId + '|' + trackLang + '|' + trackKind;
       let usedExact = false;
 
       const buildUrl = (pot) => {
-        // 播放器對同一字幕軌發出過完整網址時，優先以它為基礎
-        const exact = pot ? playerUrls.get(playerUrlKey) : null;
+        // 播放器對同一字幕軌發出過的完整網址已內含正確簽章參數（含 pot），
+        // 有就用它為基礎，比用 baseUrl 重新拼參數更可靠；
+        // 沒有才使用 baseUrl 並視 potInfo 有無決定要不要補簽章參數
+        const exact = playerUrls.get(playerUrlKey);
         const url = exact ? new URL(exact) : new URL(baseUrl, window.location.origin);
         usedExact = !!exact;
         url.searchParams.set('fmt', 'json3');
-        if (pot && !exact) {
+        if (!exact && pot) {
           url.searchParams.set('pot', pot.pot);
           url.searchParams.set('potc', pot.potc);
           url.searchParams.set('c', pot.c);
@@ -422,34 +805,70 @@
         return url.href;
       };
 
+      if (tlang) {
+        // 翻譯字幕優先走字幕稿端點：不需要 pot，也不走 timedtext 的 tlang 節流桶。
+        // 流程：抓原文字幕稿 → 從回應語言選單找翻譯到目標語言的 continuation params
+        // → 以該 params 再抓一次翻譯稿。
+        try {
+          const basePanel = await fetchTranscriptPanel(buildTranscriptParams(videoId, trackLang, trackKind));
+          const cfg = getInnertubeConfig();
+          const menuItems = extractLanguageMenuItems(basePanel);
+          const target = findTranslatedMenuItem(menuItems, tlang, cfg && cfg.client.hl);
+          let events = [];
+          if (target && target.params) {
+            await delay(400); // 兩次 InnerTube 請求錯開
+            const translatedPanel = await fetchTranscriptPanel(target.params);
+            events = parseTranscriptSegments(translatedPanel);
+          } else {
+            console.debug('[yds] transcript menu miss', { key, tlang, menuSize: menuItems.length });
+          }
+          if (events.length) {
+            console.debug('[yds] transcript used', { key, tlang, segments: events.length });
+            sendToContent('yds:data', { key, ok: true, body: JSON.stringify(events), reason: '' });
+            return;
+          }
+          // 選單查無翻譯目標或其他問題時，退回 timedtext 流程（下方）
+          console.debug('[yds] transcript fallback to timedtext', { key, tlang });
+        } catch (transcriptError) {
+          console.debug('[yds] transcript path failed', {
+            key,
+            tlang,
+            error: String((transcriptError && transcriptError.message) || transcriptError)
+          });
+        }
+      }
+
       // 第一步：先照舊版方式抓取，已經擷取到 pot 就帶上，沒有就直接抓。
       // 部分影片不需要 pot，這樣可以避免為了等 pot 而卡住不顯示。
-      let body = await fetchTimedText(buildUrl(potMatches(videoId) ? potInfo : null));
+      let body = await enqueueTimedText(() => fetchTimedText(buildUrl(potMatches(videoId) ? potInfo : null)));
 
-      // 第二步：內容為空才向播放器取得 pot 後重試，最多兩次
-      for (let attempt = 0; attempt < 2 && !body; attempt++) {
+      // 第二步：內容為空才向播放器取得 pot 後重試，最多一次（降低請求量避免 429）
+      for (let attempt = 0; attempt < 1 && !body; attempt++) {
         const pot = await obtainPot(videoId);
         if (!pot) throw new Error('no-pot');
 
-        body = await fetchTimedText(buildUrl(pot));
+        body = await enqueueTimedText(() => fetchTimedText(buildUrl(pot)));
         if (!body) {
-          // 內容仍為空，丟棄目前的 pot，下一輪重新向播放器取得
+          // 內容仍為空，丟棄目前的 pot，下次重新向播放器取得
           potInfo = null;
           playerUrls.delete(playerUrlKey);
         }
       }
 
       // 除錯資訊：在頁面的開發人員工具主控台可看到每次抓取的結果
-      console.debug('[yds] timedtext', { key, tlang, usedExact, bodyLength: body.length });
+      console.debug('[yds] timedtext', { key, tlang, usedExact, bodyLength: body ? body.length : 0 });
 
       if (!body) throw new Error(tlang ? 'empty-translate' : 'empty');
       sendToContent('yds:data', { key, ok: true, body, reason: '' });
     } catch (e) {
+      const reason = String((e && e.message) || e);
+      // 除錯資訊：429 等節流問題可在此看到發生的時間點
+      console.debug('[yds] timedtext error', { key, reason });
       sendToContent('yds:data', {
         key,
         ok: false,
         body: '',
-        reason: String((e && e.message) || e)
+        reason
       });
     }
   }

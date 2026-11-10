@@ -63,6 +63,19 @@
       font-size: 12px;
       line-height: 1.5;
     }
+    #refresh {
+      margin-top: 8px;
+      width: 100%;
+      padding: 5px 6px;
+      font-size: 12px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      background: #f8f8f8;
+      cursor: pointer;
+    }
+    #refresh:hover {
+      background: #eee;
+    }
   </style>
 </head>
 <body>
@@ -87,6 +100,7 @@
   </div>
 
   <div id="status">讀取中…</div>
+  <button id="refresh" type="button" title="清掉失敗狀態，忽略錯誤冷卻時間重新抓取字幕">重新套用（重新抓字幕）</button>
 
   <script src="popup.js"></script>
 </body>

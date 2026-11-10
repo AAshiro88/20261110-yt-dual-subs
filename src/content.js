@@ -19,6 +19,12 @@
   /** 抓取失敗後自動重試的間隔（毫秒）與次數；第一輪 21 秒、第二輪 46 秒 */
   const RETRY_DELAYS_MS = [21000, 46000];
 
+  /** HTTP 429（節流）的重試間隔：更長，讓 YouTube 的限流桶先清空 */
+  const RATE_LIMIT_RETRY_MS = [45000, 90000];
+
+  /** 重試時間加上隨機抖動的上限（毫秒），避免與其他請求同時爆發 */
+  const RETRY_JITTER_MS = 5000;
+
   /** 字幕快取最多保留的份數，超過時丟棄最舊的 */
   const CACHE_LIMIT = 20;
 
@@ -36,6 +42,7 @@
     errors: new Map(), /** 抓取失敗的 key 與原因 { reason, at } */
     specs: new Map(), /** 每個 key 的抓取規格 { baseUrl, tlang }，重試時要用 */
     slotKeys: { main: null, second: null }, /** 兩行目前需要的字幕 key */
+    cycleGen: 0, /** 抓取輪次編號，每輪 startFetchCycle 遞增，用來讓延後的排程作廢 */
     mainEvents: null, /** 第一行字幕事件 [{tStartMs, dDurationMs, text}] */
     secondEvents: null /** 第二行字幕事件 */
   };
@@ -212,10 +219,21 @@
 
     state.errors.delete(key);
     // 保留抓取規格，失敗後的自動重試需要
-    state.specs.set(key, { baseUrl: res.track.baseUrl, tlang });
+    state.specs.set(key, {
+      baseUrl: res.track.baseUrl,
+      tlang,
+      lang: res.track.languageCode || '',
+      kind: res.track.kind || ''
+    });
     state.inflight.add(key);
-    // 翻譯時加 tlang，原生時直接抓
-    sendToBridge('yds:fetch', { key, baseUrl: res.track.baseUrl, tlang });
+    // 翻譯時加 tlang，原生時直接抓；lang/kind 供字幕稿端點選軌使用
+    sendToBridge('yds:fetch', {
+      key,
+      baseUrl: res.track.baseUrl,
+      tlang,
+      lang: res.track.languageCode || '',
+      kind: res.track.kind || ''
+    });
   }
 
   /** 開始一輪抓取（第一行 ＋ 第二行，各自送出請求） */
@@ -225,8 +243,24 @@
     const mainRes = resolveMainSource();
     if (!mainRes.track || !mainRes.track.baseUrl) return;
 
+    // 新輪次：讓先前已排程但未執行的請求作廢
+    state.cycleGen += 1;
+    const gen = state.cycleGen;
+    const videoId = (state.tracks && state.tracks.videoId) || '';
+
     requestSlot('main', mainRes, force);
-    requestSlot('second', resolveSecondSource(mainRes), force);
+
+    // 第二行延後約 1 秒再抓，與第一行錯開，
+    // 避免兩筆請求同時打出被 YouTube 判定頻繁（HTTP 429）。
+    // 作廢條件：輪次改變（改設定 / 重抓）或已換影片
+    const secondRes = resolveSecondSource(mainRes);
+    if (secondRes.track && secondRes.track.baseUrl) {
+      window.setTimeout(() => {
+        if (state.cycleGen !== gen) return;
+        if (!state.tracks || (state.tracks.videoId || '') !== videoId) return;
+        requestSlot('second', secondRes, force);
+      }, 1000);
+    }
   }
 
   /** 收到 timedtext 資料，依 key 對應到目前需要這份字幕的行 */
@@ -299,21 +333,32 @@
     const slot = state.slotKeys.main === key ? 'main' : state.slotKeys.second === key ? 'second' : null;
     if (!slot) return; // 已不再是目前的顯示需求
 
+    // 依失敗原因選擇重試間隔：429 節流用更長的時間並加隨機抖動
+    const failed = state.errors.get(key);
+    const rateLimited = !!failed && String(failed.reason || '').indexOf('429') !== -1;
+    const delays = rateLimited ? RATE_LIMIT_RETRY_MS : RETRY_DELAYS_MS;
+
     const run = (attempt) => {
       const timer = window.setTimeout(() => {
         pendingRetries.delete(key);
         // 需求已改變、已經被其他來源（如擷取）補上、或重試次數用完就停止
         if (state.slotKeys[slot] !== key) return;
         if ((state.cache.get(key) || []).length) return;
-        if (attempt >= RETRY_DELAYS_MS.length) return;
+        if (attempt >= delays.length) return;
         // 採用過快取但仍失敗時，重試也要考慮已被擷取補上的情況，故快取判斷放在前面
         const spec = state.specs.get(key);
         if (!spec) return;
         state.errors.delete(key);
         state.inflight.add(key);
-        sendToBridge('yds:fetch', { key, baseUrl: spec.baseUrl, tlang: spec.tlang });
+        sendToBridge('yds:fetch', {
+          key,
+          baseUrl: spec.baseUrl,
+          tlang: spec.tlang,
+          lang: spec.lang,
+          kind: spec.kind
+        });
         run(attempt + 1);
-      }, RETRY_DELAYS_MS[attempt] || 0);
+      }, (delays[attempt] || delays[delays.length - 1]) + Math.floor(Math.random() * RETRY_JITTER_MS));
       pendingRetries.set(key, timer);
     };
     run(0);
@@ -402,17 +447,40 @@
   }
 
   /**
-   * 依內容格式解析字幕回應：json3 起始於「{」，srv3 XML 是「<」。
-   * @param {string} body timedtext 回應內容
+   * 依內容格式解析字幕回應：
+   * json3 起始於「{」、srv3 XML 是「<」、
+   * 字幕稿端點（get_transcript）的結果由 bridge 解析後以事件陣列 JSON 轉傳，起始於「[」。
+   * @param {string} body timedtext 或字幕稿的回應內容
    */
   function parseCaptionBody(body) {
     const text = String(body || '');
     if (!text.trim()) return [];
     const trimmed = text.trim();
+    if (trimmed[0] === '[') {
+      return parseEventsArray(JSON.parse(text));
+    }
     if (trimmed[0] === '{') {
       return parseJson3(JSON.parse(text));
     }
     return parseSrv3(text);
+  }
+
+  /**
+   * 解析 bridge 從字幕稿端點轉傳來的事件陣列
+   * @param {Array<{tStartMs:number, dDurationMs:number, text:string}>} arr
+   */
+  function parseEventsArray(arr) {
+    if (!Array.isArray(arr)) return [];
+    const events = arr
+      .map((ev) => ({
+        tStartMs: typeof ev.tStartMs === 'number' ? ev.tStartMs : 0,
+        dDurationMs: typeof ev.dDurationMs === 'number' ? ev.dDurationMs : 5000,
+        text: String((ev && ev.text) || '')
+      }))
+      .filter((ev) => ev.text);
+    // 依開始時間排序，方便查找
+    events.sort((a, b) => a.tStartMs - b.tStartMs);
+    return events;
   }
 
   /**
@@ -651,6 +719,18 @@
         sendResponse({ ok: true });
       });
       return true; // 非同步回應
+    } else if (msg && msg.type === 'YDS_REFRESH') {
+      // popup 的「重新套用」：清掉失敗記錄與重試排程，忽略冷卻時間重新抓一輪。
+      // 用於 F5 或操作過程被 429 卡住的情況，不必整頁重新載入。
+      for (const timer of pendingRetries.values()) window.clearTimeout(timer);
+      pendingRetries.clear();
+      state.errors.clear();
+      state.inflight.clear();
+      if (state.enabled && state.tracks) {
+        startFetchCycle(true);
+      }
+      sendResponse({ ok: true });
+      return undefined; // 同步回應
     }
     return undefined;
   });
