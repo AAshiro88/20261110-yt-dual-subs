@@ -93,6 +93,30 @@
     }
   }
 
+  /**
+   * 把播放器自己抓到的字幕回應轉傳給 content script 快取重用。
+   * 特別是翻譯字幕：播放器自己的請求帶有正確簽章，且不受 tlang 節流限制，
+   * 使用者在播放器字幕設定開啟「自動翻譯」後，這裡就能取得完整翻譯字幕。
+   * 擴充自己代抓的請求使用未被改寫的 fetch，不會經過這裡。
+   * @param rawUrl 播放器發出的請求網址
+   * @param text 回應內容（json3 或 srv3 XML）
+   */
+  function captureTimedTextResponse(rawUrl, text) {
+    try {
+      if (!text || !text.trim() || text.length > 2000000) return;
+      const u = new URL(rawUrl, window.location.origin);
+      const videoId = u.searchParams.get('v') || (cachedTracks && cachedTracks.videoId) || '';
+      const lang = u.searchParams.get('lang') || '';
+      const kind = u.searchParams.get('kind') || '';
+      const tlang = u.searchParams.get('tlang') || '';
+      // 與 content script 的 key 格式維持一致：影片編號|語言|kind|翻譯語言
+      const key = videoId + '|' + lang + '|' + kind + '|' + tlang;
+      sendToContent('yds:captured', { key, videoId, tlang, body: text });
+    } catch (e) {
+      // 網址解析失敗就忽略這次回應
+    }
+  }
+
   /** 目前記住的 pot 是否屬於指定影片 */
   function potMatches(videoId) {
     return !!potInfo && (!videoId || !potInfo.videoId || potInfo.videoId === videoId);
@@ -127,8 +151,7 @@
   }
 
   /** 若原本字幕是關閉的，取得 pot 後把播放器字幕還原為關閉 */
-  function restoreCaptionState() {
-    const player = document.getElementById('movie_player');
+  function restoreCaptionState() {    const player = document.getElementById('movie_player');
     if (!player) return;
     try {
       if (isCaptionButtonOn() && typeof player.toggleSubtitles === 'function') {
@@ -241,6 +264,14 @@
       } catch (e) {
         // 非預期的回應格式，忽略
       }
+    } else if (url.indexOf(TIMEDTEXT_PATH) !== -1) {
+      // 播放器自己抓字幕的回應整份收集起來（含翻譯字幕），供快取重用
+      try {
+        const text = await response.clone().text();
+        captureTimedTextResponse(url, text);
+      } catch (e) {
+        // 取不到回應內容就忽略
+      }
     }
 
     return response;
@@ -263,13 +294,21 @@
 
   xhrProto.send = function (...args) {
     const xhr = this;
-    if ((xhr.__ydsUrl || '').indexOf(PLAYER_API_PATH) !== -1) {
+    const requestUrl = xhr.__ydsUrl || '';
+    const isPlayerApi = requestUrl.indexOf(PLAYER_API_PATH) !== -1;
+    const isTimedText = requestUrl.indexOf(TIMEDTEXT_PATH) !== -1;
+    if (isPlayerApi || isTimedText) {
       xhr.addEventListener('load', () => {
         try {
-          const json = JSON.parse(xhr.responseText);
-          if (json && json.responseContext) extractTracksFromPlayerResponse(json);
+          if (isTimedText) {
+            // 播放器自己抓字幕的回應整份收集起來（含翻譯字幕），供快取重用
+            captureTimedTextResponse(requestUrl, xhr.responseText);
+          } else {
+            const json = JSON.parse(xhr.responseText);
+            if (json && json.responseContext) extractTracksFromPlayerResponse(json);
+          }
         } catch (e) {
-          // 忽略非 JSON 回應
+          // 忽略非預期格式或取不到 responseText 的情況
         }
       });
     }

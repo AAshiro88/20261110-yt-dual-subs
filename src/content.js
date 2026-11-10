@@ -16,6 +16,9 @@
   /** 抓取失敗後，同一份字幕在這段時間內不會自動重試（毫秒），避免觸發 YouTube 的 429 限流 */
   const ERROR_COOLDOWN_MS = 20000;
 
+  /** 抓取失敗後自動重試的間隔（毫秒）與次數；第一輪 21 秒、第二輪 46 秒 */
+  const RETRY_DELAYS_MS = [21000, 46000];
+
   /** 字幕快取最多保留的份數，超過時丟棄最舊的 */
   const CACHE_LIMIT = 20;
 
@@ -31,10 +34,14 @@
     cache: new Map(), /** 已抓取成功的字幕，key 為 "影片編號|字幕軌|翻譯語言"，值為字幕事件陣列 */
     inflight: new Set(), /** 正在抓取中的 key，避免同一份字幕重複送出請求 */
     errors: new Map(), /** 抓取失敗的 key 與原因 { reason, at } */
+    specs: new Map(), /** 每個 key 的抓取規格 { baseUrl, tlang }，重試時要用 */
     slotKeys: { main: null, second: null }, /** 兩行目前需要的字幕 key */
     mainEvents: null, /** 第一行字幕事件 [{tStartMs, dDurationMs, text}] */
     secondEvents: null /** 第二行字幕事件 */
   };
+
+  /** 排程中的重試計時器，key 為字幕 key */
+  const pendingRetries = new Map();
 
   // ---------------------------------------------------------------------------
   // 與 bridge.js 的訊息（window.postMessage）
@@ -54,6 +61,8 @@
       }
     } else if (ev.data.event === 'yds:data') {
       handleFetchResult(ev.data.payload);
+    } else if (ev.data.event === 'yds:captured') {
+      handleCaptured(ev.data.payload);
     }
   });
 
@@ -202,6 +211,8 @@
     if (failed && !force && Date.now() - failed.at < ERROR_COOLDOWN_MS) return;
 
     state.errors.delete(key);
+    // 保留抓取規格，失敗後的自動重試需要
+    state.specs.set(key, { baseUrl: res.track.baseUrl, tlang });
     state.inflight.add(key);
     // 翻譯時加 tlang，原生時直接抓
     sendToBridge('yds:fetch', { key, baseUrl: res.track.baseUrl, tlang });
@@ -226,12 +237,21 @@
 
     if (!data.ok) {
       state.errors.set(data.key, { reason: data.reason || 'unknown', at: Date.now() });
+      // 翻譯字幕常見的 429 節流是暫時性的，排程自動重試
+      scheduleRetry(data.key);
       return;
     }
 
+    // 成功就取消還沒執行的重試
+    const retryTimer = pendingRetries.get(data.key);
+    if (retryTimer) {
+      window.clearTimeout(retryTimer);
+      pendingRetries.delete(data.key);
+    }
+    state.errors.delete(data.key);
+
     try {
-      const json = JSON.parse(data.body);
-      const events = parseJson3(json);
+      const events = parseCaptionBody(data.body);
       state.cache.set(data.key, events);
       if (state.cache.size > CACHE_LIMIT) {
         state.cache.delete(state.cache.keys().next().value);
@@ -243,6 +263,60 @@
       // 回應解析失敗則該行保持空資料，並記錄原因供 popup 顯示
       state.errors.set(data.key, { reason: 'parse', at: Date.now() });
     }
+  }
+
+  /**
+   * 收到播放器自己抓的字幕回應（bridge 攔截而來）。
+   * 播放器的翻譯字幕請求不受 tlang 節流限制，這是翻譯字幕最可靠的來源之一：
+   * 使用者在播放器字幕設定開啟「自動翻譯」的瞬間，該份字幕就會經這裡進快取。
+   * @param data { key, videoId, tlang, body }
+   */
+  function handleCaptured(data) {
+    if (!data || typeof data.key !== 'string' || !data.body) return;
+    try {
+      const events = parseCaptionBody(data.body);
+      if (!events.length) return;
+      state.cache.set(data.key, events);
+      if (state.cache.size > CACHE_LIMIT) {
+        state.cache.delete(state.cache.keys().next().value);
+      }
+      if (state.slotKeys.main === data.key) setSlotEvents('main', events);
+      if (state.slotKeys.second === data.key) setSlotEvents('second', events);
+    } catch (e) {
+      // 非字幕回應或不支援的格式，忽略
+    }
+  }
+
+  /**
+   * 抓取失敗後的自動重試排程。
+   * 只重試「目前仍在需要這份字幕」的 key（換影片或改設定後不會再發），
+   * 每個 key 最多重試 RETRY_DELAYS_MS.length 次。
+   * @param key 失敗的字幕 key
+   */
+  function scheduleRetry(key) {
+    if (pendingRetries.has(key)) return; // 已有排程在等
+    // 找出這個 key 目前對應哪一行
+    const slot = state.slotKeys.main === key ? 'main' : state.slotKeys.second === key ? 'second' : null;
+    if (!slot) return; // 已不再是目前的顯示需求
+
+    const run = (attempt) => {
+      const timer = window.setTimeout(() => {
+        pendingRetries.delete(key);
+        // 需求已改變、已經被其他來源（如擷取）補上、或重試次數用完就停止
+        if (state.slotKeys[slot] !== key) return;
+        if ((state.cache.get(key) || []).length) return;
+        if (attempt >= RETRY_DELAYS_MS.length) return;
+        // 採用過快取但仍失敗時，重試也要考慮已被擷取補上的情況，故快取判斷放在前面
+        const spec = state.specs.get(key);
+        if (!spec) return;
+        state.errors.delete(key);
+        state.inflight.add(key);
+        sendToBridge('yds:fetch', { key, baseUrl: spec.baseUrl, tlang: spec.tlang });
+        run(attempt + 1);
+      }, RETRY_DELAYS_MS[attempt] || 0);
+      pendingRetries.set(key, timer);
+    };
+    run(0);
   }
 
   /** 把內部錯誤代碼轉成給使用者看的說明 */
@@ -293,6 +367,52 @@
     // 依開始時間排序，方便查找
     events.sort((a, b) => a.tStartMs - b.tStartMs);
     return events;
+  }
+
+  /**
+   * 解析 YouTube srv3 XML 字幕格式（播放器自己抓字幕時可能使用這個格式）
+   * srv3: <timedtext><body><p t="毫秒" d="毫秒">文字…</p></body></timedtext>
+   * @returns {Array<{tStartMs:number, dDurationMs:number, text:string}>}
+   */
+  function parseSrv3(xmlText) {
+    try {
+      const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+      const paragraphs = doc.getElementsByTagName('p');
+      const events = [];
+      for (const p of paragraphs) {
+        const startAttr = p.getAttribute('t');
+        if (startAttr === null) continue;
+        const tStartMs = parseInt(startAttr, 10);
+        if (Number.isNaN(tStartMs)) continue;
+        const text = (p.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        const dAttr = p.getAttribute('d');
+        events.push({
+          tStartMs,
+          dDurationMs: dAttr !== null && !Number.isNaN(parseInt(dAttr, 10)) ? parseInt(dAttr, 10) : 5000,
+          text
+        });
+      }
+      // 依開始時間排序，方便查找
+      events.sort((a, b) => a.tStartMs - b.tStartMs);
+      return events;
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /**
+   * 依內容格式解析字幕回應：json3 起始於「{」，srv3 XML 是「<」。
+   * @param {string} body timedtext 回應內容
+   */
+  function parseCaptionBody(body) {
+    const text = String(body || '');
+    if (!text.trim()) return [];
+    const trimmed = text.trim();
+    if (trimmed[0] === '{') {
+      return parseJson3(JSON.parse(text));
+    }
+    return parseSrv3(text);
   }
 
   /**
@@ -381,9 +501,27 @@
         if (mainText) {
           mainLine.textContent = mainText;
           mainLine.style.display = 'inline-block';
-          // 第二行資料還沒到或該時段沒有字幕時隱藏
-          secondLine.style.display = secondText ? 'inline-block' : 'none';
-          if (secondText) secondLine.textContent = secondText;
+          if (secondText) {
+            secondLine.textContent = secondText;
+            secondLine.classList.remove('yds-line-hint');
+            secondLine.style.display = 'inline-block';
+          } else {
+            const secondKey = state.slotKeys.second;
+            const failed =
+              secondKey && !state.inflight.has(secondKey) ? state.errors.get(secondKey) : null;
+            // 翻譯（tlang）抓取失敗時顯示提示，告知使用者自備播放器翻譯即可補上
+            const blockedTranslate =
+              failed && secondKey.slice(secondKey.lastIndexOf('|') + 1) === state.targetLang;
+            if (blockedTranslate) {
+              secondLine.textContent =
+                '⚠ 翻譯字幕被 YouTube 節流，約 20 秒後自動重試；在播放器字幕設定開啟「自動翻譯」可立即取得';
+              secondLine.classList.add('yds-line-hint');
+              secondLine.style.display = 'inline-block';
+            } else {
+              secondLine.classList.remove('yds-line-hint');
+              secondLine.style.display = 'none';
+            }
+          }
           overlay.classList.add('yds-show');
         } else {
           overlay.classList.remove('yds-show');
@@ -404,6 +542,10 @@
   window.addEventListener('yt-navigate-finish', () => {
     // 清空字幕軌與字幕資料，避免用上支影片的資料誤抓
     state.tracks = null;
+    state.specs.clear();
+    // 取消所有排程中的重試（舊影片的 key 已無意義）
+    for (const timer of pendingRetries.values()) window.clearTimeout(timer);
+    pendingRetries.clear();
     clearSlots();
     destroyOverlay();
     // 導航完成後播放器回應會由 bridge 攔截並主動送出 yds:tracks，

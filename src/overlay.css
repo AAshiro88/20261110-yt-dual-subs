@@ -46,6 +46,13 @@
   color: #ffd726;
 }
 
+/* 第二行狀態提示（例如翻譯被節流） */
+.yds-line-hint {
+  font-size: 13px;
+  color: #ff8a80;
+  background: rgba(8, 8, 8, 0.85);
+}
+
 /*
  * 雙字幕資料就緒後隱藏 YouTube 原生字幕。
  * 為了取得 pot 權杖，擴充會讓播放器保持字幕開啟，因此只能用樣式隱藏，不能直接關閉。
