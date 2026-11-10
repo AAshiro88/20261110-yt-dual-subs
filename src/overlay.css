@@ -45,3 +45,12 @@
   font-size: 17px;
   color: #ffd726;
 }
+
+/*
+ * 雙字幕資料就緒後隱藏 YouTube 原生字幕。
+ * 為了取得 pot 權杖，擴充會讓播放器保持字幕開啟，因此只能用樣式隱藏，不能直接關閉。
+ * 只有在 content.js 加上 yds-active 類別時才生效，資料抓取失敗時原生字幕仍會顯示。
+ */
+html.yds-active .ytp-caption-window-container {
+  visibility: hidden !important;
+}

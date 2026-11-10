@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "YouTube 雙字幕",
   "description": "在 YouTube 影片上同時顯示原字幕與翻譯字幕（第二字幕使用 YouTube 內建翻譯）",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

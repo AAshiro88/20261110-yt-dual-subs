@@ -35,6 +35,9 @@ const statusEl = document.getElementById('status');
 /** 目前操作到的分頁 */
 let activeTabId = null;
 
+/** 彈出視窗開啟期間，定時更新抓取狀態的計時器 */
+let statusTimer = null;
+
 function setStatus(text) {
   statusEl.textContent = text;
 }
@@ -56,6 +59,33 @@ function isAllowedUrl(url) {
 /** 填入字幕軌選項；asr 表示 YouTube 自動語音辨識產生的字幕 */
 function asrMark(kind) {
   return kind === 'asr' ? '（自動）' : '';
+}
+
+/** 依 content script 回報的資料組出狀態文字，包含兩行各自的抓取結果 */
+function composeStatus(state) {
+  if (!state.enabled) return '已停用';
+  return (
+    '運作中，第一行：' + (state.statusMain || '待處理') +
+    '；第二行：' + (state.statusSecond || '待處理')
+  );
+}
+
+/** 定時向 content script 查詢最新狀態，讓使用者看得到載入中或失敗原因 */
+function startStatusPolling() {
+  if (statusTimer !== null) return;
+  statusTimer = window.setInterval(async () => {
+    if (activeTabId == null) return;
+    try {
+      const latest = await chrome.tabs.sendMessage(activeTabId, { type: 'YDS_QUERY' });
+      if (latest && latest.ok) {
+        // 以開關畫面為準，避免使用者剛切換開關時被舊資料蓋掉
+        latest.enabled = toggleEl.classList.contains('on');
+        setStatus(composeStatus(latest));
+      }
+    } catch (e) {
+      // 分頁已關閉或重新載入，下次輪詢再試
+    }
+  }, 1500);
 }
 
 /** 取得目前分頁並查詢 content script 狀態 */
@@ -160,7 +190,8 @@ async function init() {
 
   targetEl.value = state.targetLang || 'zh-Hant';
   if (targetEl.selectedIndex === -1) targetEl.value = 'zh-Hant';
-  setStatus(state.enabled ? '運作中' : '已停用');
+  setStatus(composeStatus(state));
+  startStatusPolling();
 }
 
 /** 送設定到 content script */

@@ -10,6 +10,7 @@
 1. 開啟 `chrome://extensions/`（Edge 為 `edge://extensions/`）
 2. 右上角開啟「開發人員模式」
 3. 點「載入未封裝項目」，選擇本資料夾（含 `manifest.json` 的這層）
+4. 更新程式碼後，在擴充頁面按「重新載入」，並重新整理 YouTube 分頁
 
 ## 使用方式
 
@@ -20,6 +21,7 @@
      - `自動`（第一行＝原字幕軌；第二行＝原生第二語言軌優先，沒有才機器翻譯）
      - `機器翻譯`（使用下方設定的語言，預設繁體中文）
      - 該影片任何一條原生字幕軌（含 ASR 自動字幕）
+   - 視窗下方的狀態列會顯示兩行各自的抓取結果（句數、載入中、或失敗原因）
 
 常見組合範例：
 - 第一行「機器翻譯」＋第二行「自動」→ 中譯＋原字幕（原擴充的典型用法）
@@ -34,10 +36,10 @@
 
 ```
 manifest.json      擴充定義（MV3）
-src/bridge.js      MAIN world：攔截播放器回應取得字幕軌、代理 timedtext 抓取
-src/content.js     ISOLATED world：字幕軌挑選（原生雙語優先）、json3 解析、overlay 顯示
-src/overlay.css    overlay 樣式
-popup/             彈出設定視窗
+src/bridge.js      MAIN world：攔截播放器回應取得字幕軌、擷取 pot 權杖、代理 timedtext 抓取
+src/content.js     ISOLATED world：字幕軌挑選（原生雙語優先）、json3 解析、快取、overlay 顯示
+src/overlay.css    overlay 樣式，以及雙字幕就緒後隱藏原生字幕的規則
+popup/             彈出設定視窗（含抓取狀態顯示）
 icons/             圖示
 ```
 
@@ -50,13 +52,28 @@ icons/             圖示
 - timedtext 必須用頁面本身（同源）的憑證抓取，MV3 的 content script fetch 會被
   CORS 擋下，因此抓取由 `bridge.js`（MAIN world）代勞，再用
   `window.postMessage` 傳回 content script。
-- 每輪抓取有 `gen` 輪次編號，切換設定或換影片後的過期回應一律丟棄。
+- **pot 權杖（0.2.0 起）**：YouTube 的 timedtext 現在要求請求帶有播放器產生的
+  `pot` 簽章權杖（並搭配 `c=WEB`、`potc`），缺少時會回傳 HTTP 200 但內容為空。
+  從播放器回應取得的 baseUrl 並不含 pot，因此舊版直接抓取會得到空內容，
+  表現為原字幕與翻譯字幕都出不來。目前作法：
+  1. `bridge.js` 在 `document_start` 攔截播放器自己發出的 timedtext 請求，記下 `pot`
+  2. 若播放器尚未發出請求（使用者沒開字幕），主動呼叫播放器開啟字幕並重新載入，
+     促使播放器發出帶 pot 的請求，取得後若原本字幕是關閉的會還原為關閉
+  3. 代抓字幕時，把 `pot`、`potc`、`c` 套到來源軌 baseUrl 上，再加上 `fmt=json3` 與 `tlang`
+  4. pot 與影片綁定，換影片會重新取得；回傳空內容時會丟棄 pot 重試一次
+- 播放器為了產生 pot 必須保持字幕開啟，因此原生字幕改以樣式隱藏
+  （雙字幕資料就緒時 `html` 會加上 `yds-active` 類別，見 `overlay.css`）。
+- 抓取結果以「影片編號＋字幕軌＋翻譯語言」為 key 快取，同一份字幕不會重複請求；
+  失敗後 20 秒內不自動重試（使用者主動改設定除外），避免觸發 HTTP 429 限流。
 - 換影片（SPA 導航）時透過 `yt-navigate-finish` 事件重新抓取。
 
 ## 已知限制 / 風險
 
 - 未經完整測試，僅靜態檢查；實際效果需載入瀏覽器驗證。
-- YouTube 前端與 timedtext API 參數（如 `pot` 權杖）隨時可能改動而失效。
+- YouTube 前端與 timedtext API 參數隨時可能改動而失效，pot 機制尤其可能再變。
+- 機器翻譯（`tlang`）搭配 pot 是否一律被接受，目前沒有確切資料；
+  若原字幕能顯示但翻譯出不來，popup 狀態列會顯示「對翻譯請求回傳空內容」。
+- 短時間內大量請求 timedtext 會得到 HTTP 429，需等待一段時間。
 - YouTube 已開始對部分影片的字幕軌顯示名稱做混淆（回傳亂數字串），
   因此選單中的語言名稱一律由字幕軌的 `languageCode` 透過
   `Intl.DisplayNames` 產生，不使用 YouTube 回傳的 name 欄位。
@@ -65,3 +82,5 @@ icons/             圖示
 - 直播影片的字幕格式與點播不同，目前未處理。
 - 隱藏 YouTube 原生字幕依賴 `.ytp-caption-window-container` selector，
   若 YouTube 改版類名改變，原生字幕會與雙字幕同時顯示。
+- 開啟與還原播放器字幕依賴 `toggleSubtitlesOn`、`toggleSubtitles`、
+  `setOption('captions','reload')` 這些播放器內部方法，YouTube 改版後可能失效。

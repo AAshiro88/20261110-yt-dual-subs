@@ -13,6 +13,12 @@
 (() => {
   'use strict';
 
+  /** 抓取失敗後，同一份字幕在這段時間內不會自動重試（毫秒），避免觸發 YouTube 的 429 限流 */
+  const ERROR_COOLDOWN_MS = 20000;
+
+  /** 字幕快取最多保留的份數，超過時丟棄最舊的 */
+  const CACHE_LIMIT = 20;
+
   // ---------------------------------------------------------------------------
   // 狀態
   // ---------------------------------------------------------------------------
@@ -22,7 +28,10 @@
     sourceKey: null, /** 第一行來源字幕軌，格式 "languageCode|kind"；null = 自動 */
     secondKey: null, /** 第二行來源："track key" 指定原生軌、'translate' 指定機器翻譯；null/'' = 自動（原生雙語優先） */
     tracks: null, /** { videoId, tracks:[{baseUrl, languageCode, name, kind}] } */
-    fetchGen: 0, /** 抓取輪次，過期的抓取回應會被忽略 */
+    cache: new Map(), /** 已抓取成功的字幕，key 為 "影片編號|字幕軌|翻譯語言"，值為字幕事件陣列 */
+    inflight: new Set(), /** 正在抓取中的 key，避免同一份字幕重複送出請求 */
+    errors: new Map(), /** 抓取失敗的 key 與原因 { reason, at } */
+    slotKeys: { main: null, second: null }, /** 兩行目前需要的字幕 key */
     mainEvents: null, /** 第一行字幕事件 [{tStartMs, dDurationMs, text}] */
     secondEvents: null /** 第二行字幕事件 */
   };
@@ -41,7 +50,7 @@
       state.tracks = ev.data.payload;
       // 收到新的字幕軌清單時，若已啟用就重新抓字幕（影片切換 / 初次載入）
       if (state.enabled) {
-        startFetchCycle();
+        startFetchCycle(false);
       }
     } else if (ev.data.event === 'yds:data') {
       handleFetchResult(ev.data.payload);
@@ -144,55 +153,119 @@
   // ---------------------------------------------------------------------------
   // 字幕抓取流程
   // ---------------------------------------------------------------------------
+
+  /** 把字幕事件指定給某一行 */
+  function setSlotEvents(slot, events) {
+    if (slot === 'main') {
+      state.mainEvents = events;
+    } else {
+      state.secondEvents = events;
+    }
+  }
+
+  /** 清空兩行的需求與顯示資料，快取與進行中的請求保留供之後重用 */
+  function clearSlots() {
+    state.slotKeys.main = null;
+    state.slotKeys.second = null;
+    state.mainEvents = null;
+    state.secondEvents = null;
+  }
+
+  /**
+   * 為單一行準備字幕：快取有就直接用，否則送出抓取請求。
+   * 同一份字幕正在抓取、或剛失敗不久時不會重複送出請求。
+   * @param slot - 'main' 或 'second'
+   * @param res - 該行的來源解析結果
+   * @param force - 為 true 時忽略失敗後的冷卻時間
+   */
+  function requestSlot(slot, res, force) {
+    if (!res || !res.track || !res.track.baseUrl) {
+      state.slotKeys[slot] = null;
+      setSlotEvents(slot, null);
+      return;
+    }
+
+    const tlang = res.type === 'translate' ? state.targetLang : '';
+    const videoId = (state.tracks && state.tracks.videoId) || '';
+    const key = videoId + '|' + trackKeyOf(res.track) + '|' + tlang;
+    state.slotKeys[slot] = key;
+
+    const cached = state.cache.get(key);
+    if (cached) {
+      setSlotEvents(slot, cached);
+      return;
+    }
+    setSlotEvents(slot, null);
+
+    if (state.inflight.has(key)) return;
+    const failed = state.errors.get(key);
+    if (failed && !force && Date.now() - failed.at < ERROR_COOLDOWN_MS) return;
+
+    state.errors.delete(key);
+    state.inflight.add(key);
+    // 翻譯時加 tlang，原生時直接抓
+    sendToBridge('yds:fetch', { key, baseUrl: res.track.baseUrl, tlang });
+  }
+
   /** 開始一輪抓取（第一行 ＋ 第二行，各自送出請求） */
-  function startFetchCycle() {
+  function startFetchCycle(force) {
     if (!state.tracks) return;
 
     const mainRes = resolveMainSource();
     if (!mainRes.track || !mainRes.track.baseUrl) return;
 
-    // 新輪次：舊的過期回應一律忽略
-    state.fetchGen += 1;
-    const gen = state.fetchGen;
-    state.mainEvents = null;
-    state.secondEvents = null;
-
-    // 第一行：翻譯時加 tlang，原生時直接抓
-    sendToBridge('yds:fetch', {
-      gen,
-      slot: 'main',
-      baseUrl: mainRes.track.baseUrl,
-      tlang: mainRes.type === 'translate' ? state.targetLang : ''
-    });
-
-    const secondRes = resolveSecondSource(mainRes);
-    if (secondRes.track && secondRes.track.baseUrl) {
-      sendToBridge('yds:fetch', {
-        gen,
-        slot: 'second',
-        baseUrl: secondRes.track.baseUrl,
-        tlang: secondRes.type === 'translate' ? state.targetLang : ''
-      });
-    }
+    requestSlot('main', mainRes, force);
+    requestSlot('second', resolveSecondSource(mainRes), force);
   }
 
-  /** 收到 timedtext 資料（依 gen 判斷是否過期） */
+  /** 收到 timedtext 資料，依 key 對應到目前需要這份字幕的行 */
   function handleFetchResult(data) {
-    if (!data || typeof data.gen !== 'number' || data.gen !== state.fetchGen) return;
+    if (!data || typeof data.key !== 'string') return;
 
-    if (!data.ok) return;
+    state.inflight.delete(data.key);
+
+    if (!data.ok) {
+      state.errors.set(data.key, { reason: data.reason || 'unknown', at: Date.now() });
+      return;
+    }
 
     try {
       const json = JSON.parse(data.body);
       const events = parseJson3(json);
-      if (data.slot === 'main') {
-        state.mainEvents = events;
-      } else if (data.slot === 'second') {
-        state.secondEvents = events;
+      state.cache.set(data.key, events);
+      if (state.cache.size > CACHE_LIMIT) {
+        state.cache.delete(state.cache.keys().next().value);
       }
+      // 換影片或改設定後，已不需要的字幕只會留在快取，不會被顯示
+      if (state.slotKeys.main === data.key) state.mainEvents = events;
+      if (state.slotKeys.second === data.key) state.secondEvents = events;
     } catch (e) {
-      // 回應解析失敗則該行保持空資料
+      // 回應解析失敗則該行保持空資料，並記錄原因供 popup 顯示
+      state.errors.set(data.key, { reason: 'parse', at: Date.now() });
     }
+  }
+
+  /** 把內部錯誤代碼轉成給使用者看的說明 */
+  function describeError(reason) {
+    if (reason === 'no-pot') return '取不到播放器的 pot 權杖，請確認影片可正常播放';
+    if (reason === 'empty') return 'YouTube 回傳空內容';
+    if (reason === 'empty-translate') return 'YouTube 對翻譯請求回傳空內容';
+    if (reason === 'parse') return '字幕資料解析失敗';
+    const m = /HTTP (\d+)/.exec(reason);
+    if (m) return m[1] === '429' ? '請求過於頻繁（HTTP 429），請稍後再試' : 'HTTP 狀態 ' + m[1];
+    return reason;
+  }
+
+  /** 產生某一行目前的狀態說明，供 popup 顯示 */
+  function describeSlotStatus(slot) {
+    const key = state.slotKeys[slot];
+    if (!key) return '無';
+    const cached = state.cache.get(key);
+    if (cached) return cached.length + ' 句';
+    if (state.inflight.has(key)) return '載入中';
+    const failed = state.errors.get(key);
+    if (failed) return '失敗，' + describeError(failed.reason);
+    return '待處理';
   }
 
   /**
@@ -224,18 +297,21 @@
 
   /**
    * 找出 currentTime 所在的字幕事件
+   * 自動字幕的事件時間常會互相重疊，因此取「開始時間最晚且仍在顯示期間」的那一筆，
+   * 開始時間已超過目前時間之後的事件不需要再往後檢查。
    * @returns {string} 目前顯示文字，没有命中回傳空字串
    */
   function textAt(events, currentMs) {
     if (!events || !events.length) return '';
-    // 線性掃描即可（事件數通常數百），保持簡單可靠
+    let hit = '';
     for (let i = 0; i < events.length; i++) {
       const ev = events[i];
-      if (currentMs >= ev.tStartMs && currentMs < ev.tStartMs + ev.dDurationMs) {
-        return ev.text;
+      if (ev.tStartMs > currentMs) break;
+      if (currentMs < ev.tStartMs + ev.dDurationMs) {
+        hit = ev.text;
       }
     }
-    return '';
+    return hit;
   }
 
   // ---------------------------------------------------------------------------
@@ -276,12 +352,26 @@
     secondLine = null;
   }
 
+  /**
+   * 雙字幕資料就緒後，替根節點加上 yds-active 類別，讓樣式隱藏 YouTube 原生字幕。
+   * 資料還沒就緒或抓取失敗時不隱藏，避免使用者什麼字幕都看不到。
+   */
+  function syncNativeCaptionHiding() {
+    const shouldHide = !!(state.enabled && state.mainEvents && state.mainEvents.length);
+    const root = document.documentElement;
+    if (root.classList.contains('yds-active') !== shouldHide) {
+      root.classList.toggle('yds-active', shouldHide);
+    }
+  }
+
   /** 顯示循環：依影片時間更新 overlay 文字 */
   function renderLoop() {
     cancelAnimationFrame(rafId);
     const tick = () => {
       const video = document.querySelector('video.html5-main-video') || document.querySelector('video');
       const dom = ensureOverlay();
+
+      syncNativeCaptionHiding();
 
       if (state.enabled && video && dom && state.mainEvents) {
         const currentMs = video.currentTime * 1000;
@@ -314,9 +404,7 @@
   window.addEventListener('yt-navigate-finish', () => {
     // 清空字幕軌與字幕資料，避免用上支影片的資料誤抓
     state.tracks = null;
-    state.mainEvents = null;
-    state.secondEvents = null;
-    state.fetchGen += 1; // 使所有在途請求失效
+    clearSlots();
     destroyOverlay();
     // 導航完成後播放器回應會由 bridge 攔截並主動送出 yds:tracks，
     // 那時會重新開始抓取；若延遲到來再補一次查詢。
@@ -366,15 +454,14 @@
 
     if (state.enabled) {
       if (needRefetch) {
-        startFetchCycle();
+        // 使用者主動改設定，忽略失敗冷卻時間直接重試
+        startFetchCycle(true);
       } else {
         sendToBridge('yds:query-tracks', {});
       }
     } else {
       // 關閉時清空資料，overlay 會自動不顯示
-      state.mainEvents = null;
-      state.secondEvents = null;
-      state.fetchGen += 1;
+      clearSlots();
     }
   }
 
@@ -391,6 +478,8 @@
         sourceKey: state.sourceKey,
         secondKey: state.secondKey || '',
         videoId: state.tracks ? state.tracks.videoId : null,
+        statusMain: describeSlotStatus('main'),
+        statusSecond: describeSlotStatus('second'),
         tracks:
           state.tracks && state.tracks.tracks
             ? state.tracks.tracks.map((t) => ({
