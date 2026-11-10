@@ -52,23 +52,45 @@
   // 字幕軌挑選
   // ---------------------------------------------------------------------------
 
+  /** 依字幕軌的 languageCode 產生人類可讀的名稱（如 "en" → "英文"） */
+  const languageDisplayNames = new Intl.DisplayNames(['zh-Hant'], { type: 'language' });
+  function describeLanguage(languageCode) {
+    try {
+      return languageDisplayNames.of(languageCode) || languageCode;
+    } catch (e) {
+      return languageCode; // Intl 不可用時退回 ISO 代碼
+    }
+  }
+
   /** 以 "languageCode|kind" 格式組字幕軌 key */
   function trackKeyOf(track) {
     return track.languageCode + '|' + track.kind;
   }
 
-  /** 依目前選擇決定第一行要使用的字幕軌 */
-  function pickMainTrack() {
+  /** 在原生字幕軌中依自動規則挑一條（人工軌優先於 ASR） */
+  function pickNativeTrack() {
     const tracks = state.tracks && state.tracks.tracks;
     if (!tracks || !tracks.length) return null;
-
-    if (state.sourceKey) {
-      const found = tracks.find((t) => trackKeyOf(t) === state.sourceKey);
-      if (found) return found;
-    }
-    // 自動選擇：優先人工字幕（kind 不是 asr），否則第一軌
     const manual = tracks.find((t) => t.kind !== 'asr');
     return manual || tracks[0];
+  }
+
+  /**
+   * 依目前選擇決定第一行的內容來源。
+   * type 為 'translate' 時，track 欄位是「翻譯基底軌」（抓該軌 baseUrl 加 tlang）。
+   * @returns {{type:'native', track:object} | {type:'translate', track:object|null}}
+   */
+  function resolveMainSource() {
+    const tracks = (state.tracks && state.tracks.tracks) || [];
+    if (state.sourceKey === 'translate') {
+      return { type: 'translate', track: pickNativeTrack() };
+    }
+    if (state.sourceKey) {
+      const found = tracks.find((t) => trackKeyOf(t) === state.sourceKey);
+      if (found) return { type: 'native', track: found };
+    }
+    // 自動：使用原生軌（人工軌優先）
+    return { type: 'native', track: pickNativeTrack() };
   }
 
   /**
@@ -76,33 +98,47 @@
    * 優先序：
    *   1. 使用者指定原生軌（secondKey 是 track key）
    *   2. 使用者指定機器翻譯（secondKey = 'translate'）
-   *   3. 自動：影片原生有第二種語言的字幕軌 → 直接使用（人工軌優先於 ASR）
-   *   4. 自動且原生只有一種語言 → 退回機器翻譯
-   * @param {{languageCode:string}} mainTrack
-   * @returns {{type:'native', track:object} | {type:'translate'}}
+   *   3. 自動：第一行是原生軌時，挑語言不同的原生軌（人工軌優先於 ASR）；
+   *            第一行是翻譯時，改顯示原生原字幕
+   *   4. 自動且無原生軌可用 → 退回機器翻譯
+   * @param {{type:string, track?:object}} mainRes - 第一行的解析結果
    */
-  function resolveSecondSource(mainTrack) {
+  function resolveSecondSource(mainRes) {
     const tracks = (state.tracks && state.tracks.tracks) || [];
+    const baseTrack = (mainRes && mainRes.track) || pickNativeTrack();
 
     if (state.secondKey === 'translate') {
-      return { type: 'translate' };
+      return { type: 'translate', track: baseTrack };
     }
     if (state.secondKey) {
       const found = tracks.find((t) => trackKeyOf(t) === state.secondKey);
-      if (found && (!mainTrack || trackKeyOf(found) !== trackKeyOf(mainTrack))) {
+      if (!found) {
+        return { type: 'translate', track: baseTrack }; // 這支影片沒有該軌，退回翻譯
+      }
+      // 第一行是「原生軌」時，第二行不能選同一軌（顯示兩次沒意義）→ 退回翻譯；
+      // 第一行是翻譯時，第二行選任何原生軌都不會重複
+      const sameAsNativeMain =
+        mainRes && mainRes.type === 'native' && trackKeyOf(found) === trackKeyOf(mainRes.track);
+      if (!sameAsNativeMain) {
         return { type: 'native', track: found };
       }
+      return { type: 'translate', track: baseTrack };
     }
-    if (mainTrack) {
-      // 自動：挑一個與主軌語言不同的原生軌，人工字幕優先
+    // 自動
+    if (mainRes && mainRes.type === 'native') {
+      const mainCode = mainRes.track.languageCode;
       const manualSecond = tracks.find(
-        (t) => t.languageCode !== mainTrack.languageCode && t.kind !== 'asr'
+        (t) => t.languageCode !== mainCode && t.kind !== 'asr'
       );
       if (manualSecond) return { type: 'native', track: manualSecond };
-      const anySecond = tracks.find((t) => t.languageCode !== mainTrack.languageCode);
+      const anySecond = tracks.find((t) => t.languageCode !== mainCode);
       if (anySecond) return { type: 'native', track: anySecond };
+      return { type: 'translate', track: baseTrack }; // 原生只有一種語言 → 翻譯
     }
-    return { type: 'translate' };
+    // 第一行是翻譯 → 自動顯示原生原字幕（人工軌優先）
+    const native = pickNativeTrack();
+    if (native) return { type: 'native', track: native };
+    return { type: 'translate', track: baseTrack }; // 沒有任何原生軌（理論上不會發生）
   }
 
   // ---------------------------------------------------------------------------
@@ -110,8 +146,10 @@
   // ---------------------------------------------------------------------------
   /** 開始一輪抓取（第一行 ＋ 第二行，各自送出請求） */
   function startFetchCycle() {
-    const mainTrack = pickMainTrack();
-    if (!mainTrack || !mainTrack.baseUrl || !state.tracks) return;
+    if (!state.tracks) return;
+
+    const mainRes = resolveMainSource();
+    if (!mainRes.track || !mainRes.track.baseUrl) return;
 
     // 新輪次：舊的過期回應一律忽略
     state.fetchGen += 1;
@@ -119,27 +157,21 @@
     state.mainEvents = null;
     state.secondEvents = null;
 
+    // 第一行：翻譯時加 tlang，原生時直接抓
     sendToBridge('yds:fetch', {
       gen,
       slot: 'main',
-      baseUrl: mainTrack.baseUrl,
-      tlang: ''
+      baseUrl: mainRes.track.baseUrl,
+      tlang: mainRes.type === 'translate' ? state.targetLang : ''
     });
 
-    const second = resolveSecondSource(mainTrack);
-    if (second.type === 'native') {
+    const secondRes = resolveSecondSource(mainRes);
+    if (secondRes.track && secondRes.track.baseUrl) {
       sendToBridge('yds:fetch', {
         gen,
         slot: 'second',
-        baseUrl: second.track.baseUrl,
-        tlang: ''
-      });
-    } else {
-      sendToBridge('yds:fetch', {
-        gen,
-        slot: 'second',
-        baseUrl: mainTrack.baseUrl,
-        tlang: state.targetLang
+        baseUrl: secondRes.track.baseUrl,
+        tlang: secondRes.type === 'translate' ? state.targetLang : ''
       });
     }
   }
@@ -329,7 +361,7 @@
 
     if (settings.enabled !== undefined) state.enabled = settings.enabled;
     if (settings.targetLang !== undefined) state.targetLang = settings.targetLang;
-    if (settings.sourceKey !== undefined) state.sourceKey = settings.sourceKey;
+    if (settings.sourceKey !== undefined) state.sourceKey = settings.sourceKey || null;
     if (settings.secondKey !== undefined) state.secondKey = settings.secondKey || null;
 
     if (state.enabled) {
@@ -351,7 +383,7 @@
   // ---------------------------------------------------------------------------
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg && msg.type === 'YDS_QUERY') {
-      const mainTrack = pickMainTrack();
+      const mainRes = resolveMainSource();
       sendResponse({
         ok: true,
         enabled: state.enabled,
@@ -363,12 +395,19 @@
           state.tracks && state.tracks.tracks
             ? state.tracks.tracks.map((t) => ({
                 key: trackKeyOf(t),
-                label: t.name,
+                // YouTube 已開始對部分影片混淆字幕軌顯示名稱（亂數字串），
+                // 名稱一律由 languageCode 產生，不採用 YouTube 給的 name
+                label: describeLanguage(t.languageCode),
                 languageCode: t.languageCode,
                 kind: t.kind
               }))
             : [],
-        usingMain: mainTrack ? trackKeyOf(mainTrack) : null
+        usingMain:
+          mainRes && mainRes.track
+            ? mainRes.type === 'translate'
+              ? 'translate'
+              : trackKeyOf(mainRes.track)
+            : null
       });
     } else if (msg && msg.type === 'YDS_SET') {
       // popup 一次只會設定一個 key

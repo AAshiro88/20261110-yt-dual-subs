@@ -1,7 +1,7 @@
 /**
  * popup.js — 擴充快捷選單
  *
- * 控制：開關、第一行（原字幕）字幕軌、第二行來源（原生軌優先 / 機器翻譯）、
+ * 控制：開關、第一行來源（自動 / 機器翻譯 / 原生軌）、第二行來源（同左三種）、
  *       機器翻譯的目標語言。
  * 設定以 chrome.storage.sync 保存，content script 監聽變更即時套用。
  */
@@ -91,32 +91,53 @@ async function init() {
 
   drawToggle(state.enabled);
 
-  // 第一行（原字幕）字幕軌選項
-  sourceEl.textContent = '';
   if (state.tracks.length === 0) {
-    const opt = document.createElement('option');
-    opt.value = '';
-    opt.textContent = '此影片沒有可用字幕';
-    opt.disabled = true;
-    sourceEl.appendChild(opt);
+    // 此影片沒有字幕軌：兩個選單都鎖住
+    const disabledOpt = document.createElement('option');
+    disabledOpt.value = '';
+    disabledOpt.textContent = '此影片沒有可用字幕';
+    disabledOpt.disabled = true;
+    sourceEl.textContent = '';
+    sourceEl.appendChild(disabledOpt);
+
     secondEl.textContent = '';
     const noTrack = document.createElement('option');
     noTrack.value = '';
     noTrack.textContent = '—';
     noTrack.disabled = true;
     secondEl.appendChild(noTrack);
+
     setStatus('此影片沒有字幕軌');
     return;
   }
-  for (const track of state.tracks) {
+
+  const trackOptions = () => state.tracks.map((track) => ({
+    value: track.key,
+    label: `${track.label} ${asrMark(track.kind)}`
+  }));
+
+  // 第一行：自動（原字幕軌）+ 機器翻譯 + 各原生字幕軌，全部可選
+  sourceEl.textContent = '';
+  const autoMainOpt = document.createElement('option');
+  autoMainOpt.value = '';
+  autoMainOpt.textContent = '自動（原字幕軌）';
+  sourceEl.appendChild(autoMainOpt);
+
+  const transMainOpt = document.createElement('option');
+  transMainOpt.value = 'translate';
+  transMainOpt.textContent = '機器翻譯（使用下方語言）';
+  sourceEl.appendChild(transMainOpt);
+  for (const optInfo of trackOptions()) {
     const opt = document.createElement('option');
-    opt.value = track.key;
-    opt.textContent = `${track.label} ${asrMark(track.kind)}`;
+    opt.value = optInfo.value;
+    opt.textContent = optInfo.label;
     sourceEl.appendChild(opt);
   }
-  sourceEl.value = state.usingMain || state.tracks[0].key;
+  // 顯示「使用者實際儲存的選擇」，目前影片沒有該軌時退回自動（避免空白選項）
+  sourceEl.value = state.sourceKey || '';
+  if (sourceEl.selectedIndex === -1) sourceEl.value = '';
 
-  // 第二行選項：自動 / 機器翻譯 / 各原生字幕軌
+  // 第二行：自動 / 機器翻譯 / 各原生字幕軌
   secondEl.textContent = '';
   const autoOpt = document.createElement('option');
   autoOpt.value = '';
@@ -128,15 +149,17 @@ async function init() {
   transOpt.textContent = '機器翻譯（使用下方語言）';
   secondEl.appendChild(transOpt);
 
-  for (const track of state.tracks) {
+  for (const optInfo of trackOptions()) {
     const opt = document.createElement('option');
-    opt.value = track.key;
-    opt.textContent = `原生：${track.label} ${asrMark(track.kind)}`;
+    opt.value = optInfo.value;
+    opt.textContent = optInfo.label;
     secondEl.appendChild(opt);
   }
   secondEl.value = state.secondKey || '';
+  if (secondEl.selectedIndex === -1) secondEl.value = '';
 
   targetEl.value = state.targetLang || 'zh-Hant';
+  if (targetEl.selectedIndex === -1) targetEl.value = 'zh-Hant';
   setStatus(state.enabled ? '運作中' : '已停用');
 }
 
