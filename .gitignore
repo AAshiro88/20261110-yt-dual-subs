@@ -1,0 +1,23 @@
+# 作業系統檔案
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 編輯器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 打包產物（封裝擴充用的 zip / crx 不需版控）
+*.zip
+*.crx
+*.pem
+
+# 若日後加入 Node 工具鏈（如 lint / build 用）使用
+node_modules/
+
+# 暫存與備份檔
+*.log
+*.bak
+*~

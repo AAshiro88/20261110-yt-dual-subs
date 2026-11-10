@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <title>YouTube 雙字幕</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 12px;
+      width: 280px;
+      font-family: 'Noto Sans TC', 'Microsoft JhengHei', sans-serif;
+      font-size: 13px;
+      color: #222;
+      background: #fff;
+    }
+    .row {
+      margin-bottom: 10px;
+    }
+    label {
+      display: block;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    select {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 4px 6px;
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .toggle {
+      position: relative;
+      width: 44px;
+      height: 24px;
+      border-radius: 12px;
+      background: #c8c8c8;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .toggle::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #fff;
+      transition: left 0.2s;
+    }
+    .toggle.on {
+      background: #cc0000;
+    }
+    .toggle.on::after {
+      left: 22px;
+    }
+    #status {
+      margin-top: 6px;
+      color: #666;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="row toggle-row">
+    <strong>YouTube 雙字幕</strong>
+    <div id="toggle" class="toggle" title="切換開啟 / 關閉"></div>
+  </div>
+
+  <div class="row">
+    <label for="source">第一行（原字幕）</label>
+    <select id="source"></select>
+  </div>
+
+  <div class="row">
+    <label for="second">第二行</label>
+    <select id="second"></select>
+  </div>
+
+  <div class="row">
+    <label for="target">機器翻譯語言</label>
+    <select id="target"></select>
+  </div>
+
+  <div id="status">讀取中…</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

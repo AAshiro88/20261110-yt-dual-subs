@@ -1,0 +1,47 @@
+/*
+ * overlay.css — 雙字幕 overlay 樣式
+ * 依 YouTube 原生字幕的視覺風格設計：白字、深色半透明背景、置中。
+ */
+
+.yds-overlay {
+  position: absolute;
+  left: 50%;
+  bottom: 7%;
+  transform: translateX(-50%);
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 90%;
+  max-width: 90%;
+  text-align: center;
+  pointer-events: none;
+  z-index: 60;
+  font-family: 'YouTube Noto', 'Noto Sans TC', Roboto, Arial, sans-serif;
+}
+
+.yds-overlay.yds-show {
+  display: flex;
+}
+
+.yds-line {
+  display: inline-block;
+  max-width: 100%;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  padding: 2px 6px;
+  border-radius: 2px;
+  background: rgba(8, 8, 8, 0.75);
+  color: #fff;
+  white-space: normal;
+  word-break: break-word;
+  font-size: 20px;
+  line-height: 1.4;
+  overflow-wrap: normal;
+}
+
+/* 第二行：原生第二語言軌或機器翻譯，稍小字級便於區分 */
+.yds-line-second {
+  font-size: 17px;
+  color: #ffd726;
+}
