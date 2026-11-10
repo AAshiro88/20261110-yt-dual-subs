@@ -134,6 +134,8 @@
    * 催促播放器發出一次帶 pot 的 timedtext 請求。
    * 第一次先開啟字幕，之後改用重新載入字幕，因為剛開啟時播放器的簽章模組
    * 可能還沒準備好，第一個請求會沒有 pot。
+   * CC 已經開啟時，單純 toggleSubtitlesOn 不會讓播放器發出新請求，
+   * reload 也可能無效，因此先關閉再開啟，迫使播放器重新請求字幕軌。
    * @param attempt 第幾次嘗試，從 0 開始
    */
   function pokePlayer(attempt) {
@@ -141,7 +143,25 @@
     if (!player) return;
     try {
       if (attempt === 0) {
-        if (typeof player.toggleSubtitlesOn === 'function') player.toggleSubtitlesOn();
+        if (isCaptionButtonOn()) {
+          // CC 已開啟：關閉 → 稍後再開啟，觸發重新請求（使用者原本的開啟狀態會被還原）
+          if (typeof player.toggleSubtitles === 'function') {
+            player.toggleSubtitles(); // 關閉
+            window.setTimeout(() => {
+              try {
+                if (typeof player.toggleSubtitles === 'function') {
+                  player.toggleSubtitles(); // 重新開啟，這次請求會帶 pot
+                }
+              } catch (e) {
+                // 重新開啟失敗於下一輪再試
+              }
+            }, 700);
+          } else if (typeof player.toggleSubtitlesOn === 'function') {
+            player.toggleSubtitlesOn();
+          }
+        } else if (typeof player.toggleSubtitlesOn === 'function') {
+          player.toggleSubtitlesOn();
+        }
       } else if (typeof player.setOption === 'function') {
         player.setOption('captions', 'reload', true);
       }
