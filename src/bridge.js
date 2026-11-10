@@ -38,6 +38,13 @@
   /** 正在等待 pot 的影片，同一支影片只會同時有一個等待流程 */
   const potPromises = new Map();
 
+  /**
+   * 播放器對各字幕軌發出的完整 timedtext 網址（含 pot 與所有簽章參數）。
+   * key 格式為 影片編號、語言代碼、kind 以直線符號相連。
+   * 翻譯字幕以播放器的完整網址為基礎再加 tlang，比自己用 baseUrl 拼湊更可靠。
+   */
+  const playerUrls = new Map();
+
   /** 送訊息給隔離世界的 content script */
   function sendToContent(event, payload) {
     try {
@@ -73,6 +80,14 @@
         potc: u.searchParams.get('potc') || '1',
         c: u.searchParams.get('c') || 'WEB'
       };
+      // 同時記下這條字幕軌的完整網址，供翻譯請求使用
+      playerUrls.set(
+        potInfo.videoId + '|' + (u.searchParams.get('lang') || '') + '|' + (u.searchParams.get('kind') || ''),
+        u.href
+      );
+      if (playerUrls.size > 30) {
+        playerUrls.delete(playerUrls.keys().next().value);
+      }
     } catch (e) {
       // 網址解析失敗就忽略這次請求
     }
@@ -323,27 +338,50 @@
   async function handleSubtitleFetch(key, baseUrl, tlang) {
     try {
       const videoId = videoIdOfUrl(baseUrl) || (cachedTracks && cachedTracks.videoId) || '';
-      let body = '';
+      /** 組出請求網址；pot 為 null 時不帶簽章參數，與舊版行為相同 */
+      const trackUrl = new URL(baseUrl, window.location.origin);
+      const playerUrlKey =
+        videoId + '|' + (trackUrl.searchParams.get('lang') || '') + '|' + (trackUrl.searchParams.get('kind') || '');
+      let usedExact = false;
 
+      const buildUrl = (pot) => {
+        // 播放器對同一字幕軌發出過完整網址時，優先以它為基礎
+        const exact = pot ? playerUrls.get(playerUrlKey) : null;
+        const url = exact ? new URL(exact) : new URL(baseUrl, window.location.origin);
+        usedExact = !!exact;
+        url.searchParams.set('fmt', 'json3');
+        if (pot && !exact) {
+          url.searchParams.set('pot', pot.pot);
+          url.searchParams.set('potc', pot.potc);
+          url.searchParams.set('c', pot.c);
+        }
+        // 播放器網址若原本帶有翻譯參數，先移除，只依本次需求決定
+        url.searchParams.delete('tlang');
+        if (tlang) {
+          url.searchParams.set('tlang', tlang);
+        }
+        return url.href;
+      };
+
+      // 第一步：先照舊版方式抓取，已經擷取到 pot 就帶上，沒有就直接抓。
+      // 部分影片不需要 pot，這樣可以避免為了等 pot 而卡住不顯示。
+      let body = await fetchTimedText(buildUrl(potMatches(videoId) ? potInfo : null));
+
+      // 第二步：內容為空才向播放器取得 pot 後重試，最多兩次
       for (let attempt = 0; attempt < 2 && !body; attempt++) {
         const pot = await obtainPot(videoId);
         if (!pot) throw new Error('no-pot');
 
-        const url = new URL(baseUrl, window.location.origin);
-        url.searchParams.set('fmt', 'json3');
-        url.searchParams.set('pot', pot.pot);
-        url.searchParams.set('potc', pot.potc);
-        url.searchParams.set('c', pot.c);
-        if (tlang) {
-          url.searchParams.set('tlang', tlang);
-        }
-
-        body = await fetchTimedText(url.href);
+        body = await fetchTimedText(buildUrl(pot));
         if (!body) {
-          // 內容為空，丟棄目前的 pot，下一輪重新向播放器取得
+          // 內容仍為空，丟棄目前的 pot，下一輪重新向播放器取得
           potInfo = null;
+          playerUrls.delete(playerUrlKey);
         }
       }
+
+      // 除錯資訊：在頁面的開發人員工具主控台可看到每次抓取的結果
+      console.debug('[yds] timedtext', { key, tlang, usedExact, bodyLength: body.length });
 
       if (!body) throw new Error(tlang ? 'empty-translate' : 'empty');
       sendToContent('yds:data', { key, ok: true, body, reason: '' });
