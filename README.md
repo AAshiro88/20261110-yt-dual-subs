@@ -76,19 +76,17 @@ icons/             圖示
 
 - 未經完整測試，僅靜態檢查；實際效果需載入瀏覽器驗證。
 - YouTube 前端與 timedtext API 參數隨時可能改動而失效，pot 機制尤其可能再變。
-- **機器翻譯改走字幕稿端點（`get_transcript`）**：timedtext 的 `tlang` 翻譯
-  自 2025 年中被 YouTube 單獨節流（HTTP 429 或空內容；原生字幕軌不受影響，
-  見 yt-dlp issue #13831、youtube-transcript-api issue #572），且帶正確 pot
-  也不保證能過。擴充目前翻譯字幕依序嘗試：
-  1. **字幕稿端點**（YouTube「顯示字幕稿」面板使用的內部 API，頁面自身憑證、
-     不需要 pot、不走 tlang 節流）：先抓原文字幕稿，再從回應的語言選單取
-     翻譯語言的 continuation params 抓翻譯稿
-  2. 字幕稿端點失敗（如部分影片需要 attestation）才退回 timedtext：序列化
-     請求＋pot 重試＋429 長退避（45 秒、90 秒加隨機抖動）
-  3. 播放器自身翻譯回應攔截重用（`yds:captured`）仍在，若影片先前在
-     播放器字幕設定開啟過「自動翻譯」，會直接從快取命中
+- **預設路徑改為字幕稿端點（`get_transcript`），原生與翻譯都是**：此端點是
+  YouTube「顯示字幕稿」面板的內部 API，頁面自身憑證、不需要 pot、
+  不受 timedtext 的 `tlang` 節流（timedtext 自 2025 年中被單獨限流，見
+  yt-dlp issue #13831、youtube-transcript-api issue #572）。同一軌的基礎
+  字幕稿（含翻譯語言選單）會快取共用，「翻譯＋原字幕」成對顯示只抓一次。
+  字幕稿端點失敗（如部分影片需要 attestation）才退回 timedtext：
+  序列化請求＋pot 重試＋429 長退避（45 秒、90 秒加隨機抖動）。
 - 已知觀察：F5 硬重整後 timedtext 憑證較容易被節流；SPA 站內導航（上一頁、
   影片切換）成功率較高。字幕稿端點不受此影響。
+- popup 的「重新套用（重新抓字幕）」會清掉失敗狀態與錯誤冷卻，整輪重抓，
+  被節流卡住時不需要整頁重新載入。
 - 短時間內大量請求 timedtext 會得到 HTTP 429，需等待一段時間。
 - YouTube 已開始對部分影片的字幕軌顯示名稱做混淆（回傳亂數字串），
   因此選單中的語言名稱一律由字幕軌的 `languageCode` 透過

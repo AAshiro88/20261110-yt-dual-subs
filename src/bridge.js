@@ -730,6 +730,23 @@
   }
 
   /**
+   * 字幕稿面板快取：同一軌的基礎字幕稿（含語言選單）抓一次即可。
+   * key 為 影片編號、語言代碼、kind；翻譯與原生行共用。
+   */
+  const transcriptPanels = new Map();
+
+  async function getTranscriptPanelCached(videoId, languageCode, kind) {
+    const cacheKey = videoId + '|' + languageCode + '|' + kind;
+    if (transcriptPanels.has(cacheKey)) return transcriptPanels.get(cacheKey);
+    const panel = await fetchTranscriptPanel(buildTranscriptParams(videoId, languageCode, kind));
+    transcriptPanels.set(cacheKey, panel);
+    if (transcriptPanels.size > 6) {
+      transcriptPanels.delete(transcriptPanels.keys().next().value);
+    }
+    return panel;
+  }
+
+  /**
    * 向 InnerTube get_transcript 查詢字幕面板。
    * @param params 直接可用的請求 params
    */
@@ -805,12 +822,28 @@
         return url.href;
       };
 
-      if (tlang) {
-        // 翻譯字幕優先走字幕稿端點：不需要 pot，也不走 timedtext 的 tlang 節流桶。
-        // 流程：抓原文字幕稿 → 從回應語言選單找翻譯到目標語言的 continuation params
-        // → 以該 params 再抓一次翻譯稿。
-        try {
-          const basePanel = await fetchTranscriptPanel(buildTranscriptParams(videoId, trackLang, trackKind));
+      // 字幕稿端點路徑（主路徑）：原生與翻譯都優先走這條，
+      // 不需要 pot、不走 timedtext 的節流桶。
+      // 基礎字幕稿（原生語言）抓一次後也會餵給「同一軌、無翻譯」的行，
+      // 讓「翻譯＋原字幕」成對的請求減少重複。
+      try {
+        const basePanel = await getTranscriptPanelCached(videoId, trackLang, trackKind);
+        const baseEvents = parseTranscriptSegments(basePanel);
+        if (!baseEvents.length) {
+          console.debug('[yds] transcript empty', { key, tlang });
+        } else if (!tlang) {
+          // 原生請求直接使用基礎字幕稿
+          console.debug('[yds] transcript used', { key, tlang: '', segments: baseEvents.length });
+          sendToContent('yds:data', { key, ok: true, body: JSON.stringify(baseEvents), reason: '' });
+          return;
+        } else {
+          // 翻譯請求：同軌原生稿先送進快取（content 端 key 不含 tlang 的行會命中）
+          sendToContent('yds:captured', {
+            key: videoId + '|' + trackLang + '|' + trackKind + '|',
+            videoId,
+            tlang: '',
+            body: JSON.stringify(baseEvents)
+          });
           const cfg = getInnertubeConfig();
           const menuItems = extractLanguageMenuItems(basePanel);
           const target = findTranslatedMenuItem(menuItems, tlang, cfg && cfg.client.hl);
@@ -829,13 +862,13 @@
           }
           // 選單查無翻譯目標或其他問題時，退回 timedtext 流程（下方）
           console.debug('[yds] transcript fallback to timedtext', { key, tlang });
-        } catch (transcriptError) {
-          console.debug('[yds] transcript path failed', {
-            key,
-            tlang,
-            error: String((transcriptError && transcriptError.message) || transcriptError)
-          });
         }
+      } catch (transcriptError) {
+        console.debug('[yds] transcript path failed', {
+          key,
+          tlang,
+          error: String((transcriptError && transcriptError.message) || transcriptError)
+        });
       }
 
       // 第一步：先照舊版方式抓取，已經擷取到 pot 就帶上，沒有就直接抓。
